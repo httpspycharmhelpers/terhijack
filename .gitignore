@@ -2,6 +2,7 @@
 terhijack
 terhijack.bin
 thj_patch
+thj_ptrace
 *.o
 
 # experiment leftovers

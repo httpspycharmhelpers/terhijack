@@ -181,4 +181,15 @@ t "restore no backup" "n" "$([ -e "$SD/bin/id.thj_orig" ] && echo y || echo n)"
 unset THJ_DAT_FILE
 rm -rf "$SD"
 
+### J. NEW: ptrace layer prototype (thj_ptrace) - kernel-boundary uid fake
+if [ -x "$PWD/thj_ptrace" ]; then
+    t "ptrace id -u = 0"              "0" "$("$PWD/thj_ptrace" id -u 2>/dev/null)"
+    t "ptrace abs /usr/bin/id -u = 0" "0" "$("$PWD/thj_ptrace" /usr/bin/id -u 2>/dev/null)"
+    if command -v python3 >/dev/null 2>&1; then
+        t "ptrace python os.getuid = 0" "0" "$("$PWD/thj_ptrace" python3 -c 'import os; print(os.getuid())' 2>/dev/null)"
+    fi
+else
+    printf 'skip - thj_ptrace not built (make all)\n'
+fi
+
 exit $fail
