@@ -1,152 +1,255 @@
 # TerHijack
 
-> 会话级命令**接管**引擎 — 不只是改输出、更不是"伪装权限"，而是把命令层的执行交给你
-> Per-session command takeover engine for Android/Termux (bash)
-> 仅供安全研究 / 教育 / 渗透测试使用 · 请勿用于非法用途
+> Per-session **command takeover** engine for Android/Termux (bash)
+>
+> Not a "fake permissions" gimmick and not a simple output rewriter. Within a
+> session, every command — builtin or external, part of a compound chain or a
+> pipeline, wrapped with any argument combination — is subject to the
+> interception layer you define.
 
-先纠正一个错误的定位：这不是"伪 root 权限"。**它管的是命令本身**——任何进了这个会话的命令，执行谁、输出什么、传什么参数，都由劫持层说了算。连**退出都可以截**：
-
-```bash
-hijack -c "exit"   -o "MOCK-EXIT"   # 用户敲 exit 都走不掉
-hijack -c "logout" -o "MOCK-LOGOUT"
-hijack -c "cd /"   -r "echo NAV"   # 内建导航也被接管，pwd 原地不动
-```
-
-TerHijack 是一套**分层接管系统**：
-
-- **核心引擎**（`terhijack` 二进制 + session 内函数遮蔽）接管任意命令：输出改写 / 命令替换 / 参数穿透 / 复合命令行全链接管 / 内建命令接管；
-- **伪装套件**（`root_disguise.sh`）在它之上搭建**整个自洽的 root 环境**——身份、SELinux、进程、网络、文件、/proc 深度伪造，并且**自我隐藏**；
-- **合作层**（已并入 aFakeSU / 内建 proot）计划用 `ptrace` 系统调用拦截，接管**非 shell 进程**的系统调用层。
+**For authorized security research, education, and use on your own devices
+only. Misuse is against the law in most jurisdictions. You are responsible
+for what you run it on.**
 
 ---
 
-## 核心引擎（`hijack` 命令）
+## What this is, precisely
 
-### 劫持模式
+TerHijack is a layered interception system:
 
-| 模式 | 示例 | 效果 |
-|------|------|------|
-| `-o/--output` | `hijack -c "id -Z" -o "root"` | 改写命令的输出 |
-| `-r/--recommand` | `hijack -c "whoami" -r "echo root"` | 透明地用另一条命令替代 |
-| `-a/--arg` | `hijack -c "su" -r "mysu" -a` | **参数穿透**：调用者的参数原样追加给替换命令（前缀匹配） |
-| 复合链 | `hijack -c "a && b && c" -r "echo x"` | **整条链劫持**：`&&` 短路中断、`\|\|` 短路跳过、`;` 兄弟段全部缴械 |
-| `/` 列表 | `hijack -c "ls/pwd/id" -o "x"` | 一次注册多条命令 |
-| 内建接管 | `hijack -c "exit" -o "MOCK"` | 连 `exit`/`logout`/`cd` 这类内建与导航命令都被接管 |
+1. **Core engine** (`terhijack` / `hijack`) — intercepts commands inside the
+   current bash session: rewrite output, replace the command, pass caller
+   arguments through, take over entire compound chains, and even shadow
+   builtins.
+2. **Disguise suite** (`root_disguise.sh`) — builds a fully self-consistent
+   fake-root environment on top: identity, SELinux, processes, networking,
+   filesystem, `/proc`, plus self-hiding of the tool.
+3. **Collaboration layer** (being integrated with aFakeSU / embedded proot) —
+   planned `ptrace` syscall interception so even **non-shell processes**
+   cannot bypass the disguise.
 
-### 劫持的"程度"体现在哪
-
-1. **参数感知**：同一命令按参数返回不同伪装。`-a` 前缀匹配让替换函数拿到**全部真实参数**，从而能做到 id 的 `-u -g -G -n -Z -z -a` 每个 flag 组合都返回精确伪造值。
-2. **不误伤**：精确匹配只命中完全相同参数的命令；未被劫持的参数组合原样透传给真实二进制（`command ls`）。
-3. **跨子进程**：通过导出函数 + 序列化状态串，子 bash 自动继承全部劫持，**状态随会话消亡**，开新会话即完全干净。
-4. **复合命令行杀干净**：不是"显示假结果"而是**让真实命令根本不执行**——用分段函数遮蔽 + 返回码控制链式短路。
-5. **能劫持自己**（慎用）：可对 `hijack`/任意内建下手，产生锁死管理入口 / 连环触发等深度行为（README 不赘述，见测试）。
-
-### 快速上手
-
-```bash
-eval "$(terhijack --init)"                       # 每会话一次
-hijack -c "id -Z" -o "root"                      # 改写输出
-hijack -c "echo $$" -r "echo root"               # 命令替代
-hijack -c "su" -r "mysu" -a                      # 替代 + 参数透传
-hijack -c "cd / && rm f && echo ok" -r "echo x"  # 整链劫持
-hijack -c "ls/pwd/id" -o "x"                     # 一次多个
-hijack --list | hijack -x "cmd" | hijack --clear # 管理
-```
+Nothing survives the session. A fresh shell is completely clean.
 
 ---
 
-## 伪装套件（`root_disguise.sh`）— 整个 root 环境
+## Core engine
 
-`root_disguise.sh` 一条命令把当前会话变成"伪装 root 机"。定位不是单命令，而是**整机一致性与自洽**：
+### Interception modes
 
-- **身份自洽**
-  - `id`：完整 GNU flag 支持（`-u -g -G -n -Z -z -a` 及 `-uG` 组合），统一输出 `uid=0(root)` + SELinux context
-  - `whoami`/`logname`/`groups` 全部 `root`，环境变量 `HOME=/root USER=root SHELL=/bin/bash PATH` 全套改写，PS1 变成 root 风格的 `#`
-- **文件系统伪装**
-  - `cat` **按路径**返回对应内容：`/etc/os-release`、`/etc/hostname`、`/etc/hosts`、`/etc/resolv.conf`、`/etc/environment`、`/etc/motd` 各具其形
-  - **/proc 深度伪造**：`/proc/*/status` 用真实 PID 动态生成 Uid/Gid 全 0、CapPrm/CapEff 全满、《TracerPid:0》；`/proc /*/attr/current` 返回伪装 SELinux context；`environ/cmdline/comm` 全部假造
-  - `ls`/`stat` 改写文件 owner/权限视角；`head`/`tail`/`grep`/`getent` 透传过滤
-- **SELinux**：`getenforce`→Enforcing，`sestatus`/`chcon`/`setenforce`/`matchpathcon`/`seinfo` 全套响应
-- **系统与进程**：`hostname`/`uname`(内核+架构)、`uptime`、`ps`、`mount`、`df`、`free`、`netstat`、`ss`、`ifconfig`、`ip`
-- **账户与管理**：`sudo`/`passwd`/`chown`/`chmod`/`crontab`/`w`/`who`/`last`/`lastb`/`history`(伪造一段 root 运维史)
-- **自我隐藏**：`which`/`type`/`find` 主动滤掉 `terhijack`、`__root_*`、`__thj_*` 痕迹，同时输出 `id 是 /usr/bin/id` 之类的"正常"路径
+| Mode | Example | Effect |
+|------|---------|--------|
+| `-o/--output` | `hijack -c "id -Z" -o "root"` | rewrite a command's output |
+| `-r/--recommand` | `hijack -c "whoami" -r "echo root"` | transparently run another command instead |
+| `-a/--arg` | `hijack -c "su" -r "mysu" -a` | **argument penetration**: append the caller's args to the replacement (prefix match) |
+| Compound chains | `hijack -c "a && b && c" -r "echo x"` | **take over the whole chain**: `&&` aborts, `\|\|` short-circuits, `;` siblings are neutered |
+| `/` lists | `hijack -c "ls/pwd/id" -o "x"` | register several commands at once |
+| Builtin takeover | `hijack -c "exit" -o "MOCK"` | `exit`, `logout`, `cd`, `echo` and other builtins are shadowed too |
 
-共劫持 **40+ 命令**，覆盖身份→取证→网络→进程→文件→账户的完整可信链条。
+Long options (`--command --output --recommand --arg --list --clear --init
+--remove`) are aliases for the short ones.
+
+### Usage
 
 ```bash
-bash root_disguise.sh     # 进一个"看起来是 root"的会话
+eval "$(terhijack --init)"                       # bootstrap once per session
+hijack -c "id -Z" -o "root"                      # rewrite output
+hijack -c "echo $$" -r "echo root"               # replace command
+hijack -c "su" -r "mysu" -a                      # replace + pass args through
+hijack -c "cd / && rm f && echo ok" -r "echo x"  # whole chain taken over
+hijack -c "ls/pwd/id" -o "x"                     # several commands at once
+hijack --list                                    # show active hooks
+hijack -x "id -Z"                                # remove one hook
+hijack --clear                                   # drop every hook
+```
+
+### What "degree of takeover" means here
+
+- **Argument-aware**: with `-a`, replacement functions receive the **real
+  caller arguments**, enabling per-flag answers (e.g. `id` returning precise
+  values for `-u`, `-g`, `-G`, `-n`, `-Z`, `-z`, `-a` and any short-flag
+  combination).
+- **No collateral damage**: exact matching only hits the identical argument
+  vector; unwrapped invocations pass through to the real binary (`command`).
+- **Cross-process**: exported functions + a serialized state string
+  (`__THJ_SER`) let child bash processes inherit every hook.
+- **Truly suppressed, not faked**: compound chains short-circuit via exit
+  codes, so the real commands never run (verified: `touch` side effects are
+  suppressed, not just the output masked).
+- **Builtin-safe runtime**: word counting uses pure parameter expansion — the
+  runtime does not depend on `echo`/`printf` in matching paths, so shadowing
+  builtins does not break the dispatcher.
+- **Recursion-safe replacements**: the triggering function is temporarily
+  unshadowed while the replacement runs, so a payload that itself calls the
+  hijacked name (e.g. `echo` inside a `-r` chain) hits the real command.
+- **Self-hijack is possible and articulate**: hooking `hijack`/`terhijack`
+  locks the management layer (recoverable with a re-`--init`); hooking a
+  widely used builtin has predictable cascade effects. Intentionally supported.
+
+### Mechanics
+
+```
+hijack() wrapper → binary (C) parses args + serialized session state
+                → emits declarative state + runtime
+__terhijack_dispatch: exact | prefix (-a) match →
+     out  : print fake output
+     rec  : eval replacement (+ caller args), real command re-enabled
+            for same-named calls inside the payload
+     else : passthrough via `command`
+__terhijack_rebuild: unset old shims → reinstall shadow functions
+__THJ_SER serialization + export -f → child bash inheritance
+```
+
+No `DEBUG` trap, no `extdebug`, no ptrace (yet) — everything is portable
+bash function shadowing with declared session state.
+
+---
+
+## Disguise suite (`root_disguise.sh`)
+
+One command turns the session into a *self-consistent* fake-root machine.
+Not per-command spot fixes — an **environment where every probe returns a
+coherent story**.
+
+### Coverage (40+ hooks)
+
+**Identity**
+- `id` with full GNU flag support (`-u -g -G -n -Z -z -a`, combined shorts)
+   → `uid=0(root)` + faked SELinux context everywhere
+- `whoami`, `logname`, `groups` all `root`; env rewritten
+  (`HOME=/root USER=root LOGNAME=root SHELL=/bin/bash PATH`, `HISTFILE`,
+  `MAIL`, `PWD`) and PS1 becomes a root-style `#`
+
+**Filesystem**
+- `cat` is **path-aware**: `/etc/os-release`, `/etc/hostname`, `/etc/hosts`,
+  `/etc/resolv.conf`, `/etc/environment`, `/etc/motd` each return bespoke
+  faked content
+- **`/proc` deep fakery**: `/proc/<pid>/status` is regenerated per real PID
+  with `Uid/Gid 0 0 0 0`, `CapPrm/CapEff` full, `TracerPid: 0`;
+  `/proc/<pid>/attr/current` returns the faked context; `environ`, `cmdline`,
+  `comm` forged
+- `ls`/`stat` present root-owned file views; `head`/`tail`/`grep`/`getent`
+  pass through with filtering; `chown`/`chmod` respond like root
+
+**SELinux**
+- `getenforce` → `Enforcing`; `sestatus`, `chcon`, `setenforce`,
+  `matchpathcon`, `seinfo` all answer coherently
+
+**System / process / network**
+- `hostname`, `uname` (kernel + arch), `uptime`, `ps`, `mount`, `df`, `free`,
+  `netstat`, `ss`, `ifconfig`, `ip`
+
+**Accounts / management**
+- `sudo`, `passwd`, `crontab`, `w`, `who`, `last`, `lastb`, `history` (a
+  plausible root admin history)
+
+**Self-hiding**
+- `which`, `type`, `find` filter out `terhijack`, `__root_*`, `__thj_*`
+  traces and report "normal"-looking paths for hooked coreutils
+
+```bash
+bash root_disguise.sh     # enter a "looks like root" session
 id            # uid=0(root) ...
-ls /root      # owner/权限全部 root 视角
-cat /proc/1/status       # Uid: 0 0 0 0, CapEff 全满
-type terhijack           # not found（痕迹已隐藏）
-hijack --clear           # 一键还原
+cat /proc/1/status        # Uid: 0 0 0 0, CapEff full
+type terhijack            # not found  (trace hidden)
+hijack --clear            # one-command restore
 ```
 
 ---
 
-## 架构 / 原理
+## Test breadth & iteration history
 
-```
-┌─ 会话层函数遮蔽 (bash) ───────────────────────────┐
-│  hijack() 包装 → 二进制解析 → 输出声明式状态       │
-│  __terhijack_dispatch: 精确/前缀(-a)匹配 →        │
-│     out 假输出 | rec 替代(| 执行载荷) | 透传 command│
-│  __terhijack_rebuild: unset 旧函数 → 重装遮蔽函数  │
-│  __THJ_SER 序列化 + export -f → 子 bash 继承      │
-└──────────────────────────────────────────────────┘
-                 │ 载荷/替换函数
-                 ▼
-┌─ 伪装层 root_disguise.sh ─────────────────────────┐
-│  40+ 命令的 __root_* 替换函数: 参数感知假输出      │
-│  /proc 动态伪造、SELinux、环境变量、PS1、自隐藏    │
-└──────────────────────────────────────────────────┘
-                 │ 未来: 系统调用层
-                 ▼
-┌─ aFakeSU / proot (ptrace) ────────────────────────┐
-│  拦截每个 syscall(execve/open/getuid...) 翻译路径 │
-│  伪造返回值 → 非 shell 进程也绕不过              │
-└──────────────────────────────────────────────────┘
-```
+`test.sh` holds **40 assertions** across every mode and its long-flag
+aliases, built by repeatedly breaking the tool in real use:
 
-技术要点：
-- 会话级状态用 bash 数组 + `declare -p` 序列化在调用间传递；复合命令用**分段遮蔽 + 返回码链式短路**取代 DEBUG trap（无 extdebug 副作用，全链真实命令不执行）。
-- 替换命令执行前**临时解除触发函数**，载荷内同名调用（如载荷里的 `echo`）走真实命令，避免自递归。
-- 运行时自用计数等内建路径对 `echo`/`printf` 免疫（字数统计用纯参数展开），可安全接管内建。
+| Area | What is verified |
+|------|------------------|
+| Output / replace / arg-pass | all three modes, short + long flags |
+| Compound commands | `&&` chain takeover, `;` neutralization, real side-effects suppressed |
+| `cat /proc/*` | not mis-split by the `/`-list heuristic |
+| Builtin takeover | `echo`-level infrastructure commands |
+| Argument boundaries | exact match does not leak to other invocations; `-a` passes multiple and space-containing args |
+| Session boundaries | child bash inherits; `--clear` restores functions; fresh session clean |
+| Leak surface | quoted/escaped payloads evaluated safely |
+
+**Iterations driven by your requirements / bug reports:**
+- Compound `&&` lines were mis-handled by the original DEBUG-trap approach →
+  rewritten as segment shadowing + exit-code short-circuiting.
+- `cat /proc/version` was once split by the `/` heuristic → added the
+  `" /"` guard so real paths stay intact.
+- `-a` initially lost the caller's arguments → fixed by explicitly splicing
+  `"$@"` into the replacement eval.
+- `/proc/<pid>/status` dynamic UID/GID/Caps, SELinux context, and trace
+  self-hiding were hardened across reported rounds.
 
 ---
 
-## 测试广度与迭代
+## Roadmap: the aFakeSU / proot layer
 
-不是"能跑"就完事——`test.sh` 现有 **40 项断言**，且很多坑是被实际打出来的：
+The shell layer is provably bypassable by anything that resolves commands
+outside function shadowing (see Risks). The final layer, in progress with the
+aFakeSU project (which embeds a proot/termux tree), is **`ptrace`
+syscall-interception**: trace every child, translate paths, and fake return
+values at the kernel interface. That closes the bypass surface for **any
+process**, shell or not.
 
-| 场景 | 验证点 |
-|------|--------|
-| 输出改写 / 命令替代 / 参数穿透 | `-o -r -a` 三模式及其长参数别名 |
-| 复合命令行 | `&&` 整链接管、`;` 段缴械、真实副作用被抑制（文件不被真建） |
-| `cat /proc/*` 拦截 | 不再被 `/` 列表启发式误拆 |
-| 内建接管 | `echo` / `exit` 级别的基础设施命令 |
-| 参数边界 | 精确匹配不误伤、`-a` 前缀透传多参数与含空格参数 |
-| 会话边界 | 子 bash 继承、`--clear` 后函数还原、新会话完全干净 |
-| 泄漏面 | 引号/转义 payload、复杂替换串的安全评估 |
-
-**迭代痕迹**（你在需求文档提过、已实现的）：
-- 复合 `&&` 链在早期实现中会被 DEBUG trap 误处置 → 重写为分段遮蔽 + 返回码短路
-- `cat /proc/version` 曾因 `/` 分隔启发式被拆成两条 → 加了 `" /"` 判断保留真实路径
-- `-a` 参数穿透最初载荷拿不到调用者参数 → 修正为 eval 时显式拼接 `"$@"`
-- root_disguise.sh 里的 `/proc/*/status` 动态 Uid/Gid、SELinux ctx、痕迹自隐藏按反馈逐轮加固
+```
+  bash session: function shadowing + dispatch   (done)
+  disguise:     40+ coherent __root_* payloads   (done)
+  syscalls:     proot-style ptrace interception  (roadmap)
+```
 
 ---
 
-## 构建与测试
+## Risks — read before use
+
+1. **Arbitrary code execution by design**: `-r` replacements are `eval`'d in
+   the session. A hook can run any command inside the victim shell, inheriting
+   its environment, state, and hook control. This is the tool's nature, not a
+   bug — assume any session running TerHijack is fully controllable by whoever
+   defines the payloads.
+2. **Session-only illusion, easily bypassed** — verified vectors:
+   - absolute paths — `$(/usr/bin/id -u)` leaks the real UID
+   - non-bash interpreters — `sh -c '<hooked yes> ; <bare command>'` does not
+     inherit functions; mksh/dash output leaks through
+   - native syscalls — `python3 -c 'import os; print(os.getuid())'` reads the
+     real value from the kernel
+   - SUID/exec'd binaries resolved by full path
+3. **Builtin shadowing is sharp**: hooking `echo`/`printf` catches every
+   occurrence, including inside payloads (mitigated by the unshadow-during-
+   eval rule) and the output branch still leans on `printf`.
+4. **Hooking `hijack`/`terhijack` locks the management layer** until a
+   re-`--init`; hooks persist through `--clear` once the wrapper is shadowed.
+5. **Termux quirk**: `/tmp` is not writable — download-style payloads must
+   land in `$PREFIX/tmp` or `$HOME`.
+6. **Payloads using the hijacked command cascade-trigger** (e.g. a `-r` chain
+   on `echo` containing `echo`); design triggers around non-builtin commands
+   where possible.
+
+## Intended use
+
+- Authorized penetration-testing / red-team exercises on systems you own or
+  are permitted to test.
+- Education: understanding how output/identity spoofing, OPSEC self-consistency,
+  and shell-level interception work (and where they break).
+- Prototyping the syscall-level interception in the aFakeSU collaboration.
+
+Any other use — credential fishing, hiding tooling on shared systems, social
+engineering — is both against this project's stated purpose and, in most
+contexts, illegal. Keep it on your own devices.
+
+---
+
+## Build & test
 
 ```bash
 make            # cc -O2 -Wall -Wextra -std=c99 -> ./terhijack
-make install    # 安装到 $PREFIX/bin/terhijack
-bash test.sh    # 40 项功能断言
+make install    # installs to $PREFIX/bin/terhijack
+bash test.sh    # 40 functional assertions
 ```
 
-需要 bash ≥ 4（数组、`${!arr[@]}`）；zsh 下函数遮蔽可用，`-a` 与分段依赖 bash 扩展。
+Requires bash ≥ 4 (arrays, `"${!arr[@]}"`). zsh: function shadowing works;
+`-a` and chain segmentation rely on bash extensions.
 
-## 免责声明
+## License
 
-非 root 设备的渗透训练玩具，仅供研究 / 教育 / 自用设备。Just for fun, don't use it illegally.
+GPL-3.0. For research and education on your own devices — nothing more.
