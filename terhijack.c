@@ -1,5 +1,5 @@
 /*
- * TerHijack v1.1 - per-session terminal command hijacker (bash/zsh)
+ * TerHijack v1.2 - per-session terminal command hijacker (bash/zsh)
  *
  * Hooks arbitrary commands inside the CURRENT shell session: rewrite their
  * output (--output), transparently replace them with another command
@@ -8,6 +8,13 @@
  * segment as a function whose exit code short-circuits the chain (&& aborts,
  * || short-circuits, ';' segments are neutered). A fresh session is clean.
  *
+ * Persistence:
+ *   --bash     generate a wrapper that loads active hooks into every new bash
+ *   --all      patch real binaries (id cat head tail grep ls mount ps who
+ *              last hostname whoami uptime free df uname) with the thj_patch
+ *              shim answering OUT/BLOCK/FAKE records from a .dat state file
+ *   --restore  undo binary patching and clear session hooks
+ *
  * usage:
  *   eval "$(terhijack --init)"                    once per session
  *   hijack -c "id -Z" -o "root"                   fake output
@@ -15,6 +22,8 @@
  *   hijack -c "cd / && rm f && echo ok" -o "x"    whole line hijacked
  *   hijack -c "ls/pwd/id" -o "x"                  several commands at once
  *   hijack --list | -x "cmd ..." | --clear
+ *   hijack --all / --restore                      binary level / undo
+ *   terhijack --bash > b.sh                       persistent bash wrapper
  */
 
 #include <stdio.h>
@@ -24,7 +33,7 @@
 #include <getopt.h>
 #include <unistd.h>
 
-#define THJ_VERSION "1.1"
+#define THJ_VERSION "1.2"
 
 /* ------------------------------------------------------------------ */
 /* utils                                                              */
@@ -145,13 +154,26 @@ static int has_metachar(const char *s)
     return strpbrk(s, "&|;") != NULL;
 }
 
-/* 'ls/pwd/id' -> list. A real path (starts with / or contains " /") is not. */
+static char **split_list(const char *s, size_t *cnt);
+
+/* 'ls/pwd/id' -> list. Real paths/routes are not:
+ *   starts with / or ~, contains " /" (path in args), a tilde path,
+ *   or any '/' segment that is not a clean command name. */
 static int is_cmdlist(const char *s)
 {
     if (!strchr(s, '/')) return 0;
-    if (*s == '/') return 0;
-    if (strstr(s, " /")) return 0;
-    return 1;
+    if (*s == '/' || *s == '~') return 0;
+    if (strstr(s, " /") || strstr(s, "~/") || strstr(s, "./")) return 0;
+    size_t nc = 0;
+    char **segs = split_list(s, &nc);
+    int ok = nc >= 2;
+    for (size_t j = 0; ok && j < nc; j++) {
+        char *t = trim(segs[j]);
+        if (!*t || !valid_name(t)) ok = 0;
+    }
+    for (size_t j = 0; j < nc; j++) free(segs[j]);
+    free(segs);
+    return ok;
 }
 
 static char **split_list(const char *s, size_t *cnt)
@@ -433,8 +455,55 @@ static const char RUNTIME[] =
 "}\n";
 
 static const char BOOTSTRAP[] =
-"# ---- TerHijack bootstrap: defines hijack() ----\n"
+"# ---- TerHijack bootstrap: defines hijack() + persistence ----\n"
 "__THJ_BIN=\"$(command -v terhijack 2>/dev/null)\"\n"
+"\n"
+"__thj_load_file() {\n"
+"  local __t_f=\"${1:-${THJ_STATE_FILE:-}}\"\n"
+"  [ -n \"$__t_f\" ] && [ -f \"$__t_f\" ] || return 0\n"
+"  local __t_line __t_p __t_ty __t_pa __t_m __t_ifs=\"$IFS\"\n"
+"  __THJ_P=(); __THJ_T=(); __THJ_A=(); __THJ_M=()\n"
+"  while IFS= read -r __t_line; do\n"
+"    case \"$__t_line\" in\n"
+"      H*)\n"
+"        IFS=$'\\t' read -r __t_p __t_ty __t_pa __t_m <<< \"${__t_line:1}\"\n"
+"        [ -n \"$__t_p\" ] || continue\n"
+"        __THJ_P+=(\"$__t_p\"); __THJ_T+=(\"$__t_ty\")\n"
+"        __THJ_A+=(\"$__t_pa\"); __THJ_M+=(\"${__t_m:-x}\")\n"
+"        ;;\n"
+"    esac\n"
+"  done < \"$__t_f\"\n"
+"  IFS=\"$__t_ifs\"\n"
+"  __terhijack_rebuild\n"
+"}\n"
+"\n"
+"__thj_persist() {\n"
+"  [ -n \"${__THJ_P+x}\" ] || return 0\n"
+"  local __t_i __t_bn __t_map __t_bp\n"
+"  if [ -n \"${THJ_STATE_FILE:-}\" ]; then\n"
+"    : > \"$THJ_STATE_FILE\"\n"
+"    for __t_i in \"${!__THJ_P[@]}\"; do\n"
+"      printf 'H\\t%s\\t%s\\t%s\\t%s\\n' \"${__THJ_P[$__t_i]}\" \"${__THJ_T[$__t_i]}\" \"${__THJ_A[$__t_i]}\" \"${__THJ_M[$__t_i]:-x}\" >> \"$THJ_STATE_FILE\"\n"
+"    done\n"
+"  fi\n"
+"  if [ -n \"${THJ_DAT_FILE:-}\" ]; then\n"
+"    __t_map=\"\"\n"
+"    for __t_bn in id cat head tail grep ls mount ps who last hostname whoami uptime free df uname; do\n"
+"      __t_bp=\"${THJ_PFX:-${PREFIX:-/usr}/bin}/$__t_bn\"\n"
+"      [ -e \"${__t_bp}.thj_orig\" ] || continue\n"
+"      __t_map=\"${__t_map:+$__t_map,}$__t_bn=$__t_bp.thj_orig\"\n"
+"    done\n"
+"    : > \"$THJ_DAT_FILE\"\n"
+"    for __t_i in \"${!__THJ_P[@]}\"; do\n"
+"      case \"${__THJ_T[$__t_i]}\" in\n"
+"        out) printf '%s\\tOUT\\t%s\\n' \"${__THJ_P[$__t_i]%% *}\" \"${__THJ_A[$__t_i]}\" >> \"$THJ_DAT_FILE\" ;;\n"
+"        rec) printf '%s\\tBLOCK\\n' \"${__THJ_P[$__t_i]%% *}\" >> \"$THJ_DAT_FILE\" ;;\n"
+"      esac\n"
+"    done\n"
+"    [ -z \"$__t_map\" ] || printf 'type\\tFAKE\\t%s\\n' \"$__t_map\" >> \"$THJ_DAT_FILE\"\n"
+"  fi\n"
+"}\n"
+"\n"
 "hijack() {\n"
 "  if [ -z \"${__THJ_BIN:-}\" ]; then\n"
 "    __THJ_BIN=\"$(command -v terhijack 2>/dev/null)\"\n"
@@ -443,8 +512,23 @@ static const char BOOTSTRAP[] =
 "    echo \"terhijack: binary not found in PATH\" >&2\n"
 "    return 127\n"
 "  fi\n"
-"  local __t_st=\"\"\n"
+"  local __t_st=\"\" __t_argv=(\"$@\")\n"
 "  __t_st=\"$(declare -p __THJ_P __THJ_T __THJ_A __THJ_M 2>/dev/null)\"\n"
+"  if [ -z \"$__t_st\" ] && [ -n \"${__THJ_SER:-}\" ]; then\n"
+"    local __t_rec __t_hadf=\"\" __t_oldifs=\"$IFS\"\n"
+"    case $- in *f*) __t_hadf=y ;; esac\n"
+"    set -f; IFS=$'\\x1e'\n"
+"    __THJ_P=(); __THJ_T=(); __THJ_A=(); __THJ_M=()\n"
+"    for __t_rec in $__THJ_SER; do\n"
+"      IFS=$'\\x1f'\n"
+"      set -- $__t_rec\n"
+"      __THJ_P+=(\"${1:-}\"); __THJ_T+=(\"${2:-}\")\n"
+"      __THJ_A+=(\"${3:-}\"); __THJ_M+=(\"${4:-x}\")\n"
+"    done\n"
+"    IFS=\"$__t_oldifs\"; [ -n \"$__t_hadf\" ] || set +f\n"
+"    set -- \"${__t_argv[@]}\"\n"
+"    __t_st=\"$(declare -p __THJ_P __THJ_T __THJ_A __THJ_M 2>/dev/null)\"\n"
+"  fi\n"
 "  case \"${1:-}\" in\n"
 "    -l|--list)\n"
 "      THJ_STATE=\"$__t_st\" \"$__THJ_BIN\" \"$@\"\n"
@@ -456,10 +540,15 @@ static const char BOOTSTRAP[] =
 "      if [ \"$__t_rc\" -eq 0 ] && [ -n \"$__t_out\" ]; then\n"
 "        eval \"$__t_out\"\n"
 "      fi\n"
+"      if [ -n \"${THJ_STATE_FILE:-}\" ] || [ -n \"${THJ_DAT_FILE:-}\" ]; then\n"
+"        __thj_persist\n"
+"      fi\n"
 "      return \"$__t_rc\"\n"
 "      ;;\n"
 "  esac\n"
-"}\n";
+"}\n"
+"\n"
+"[ -n \"${BASH_VERSION:-}\" ] && export -f hijack __thj_load_file __thj_persist 2>/dev/null\n";
 
 /* emit authoritative full-state assignment (state was available) */
 static void emit_full_assign(void)
@@ -701,6 +790,132 @@ static void mode_list(void)
 static void mode_init(void)
 {
     fputs(BOOTSTRAP, stdout);
+    fputs(RUNTIME, stdout);
+}
+
+/* ------------------------------------------------------------------ */
+/* --bash / --all / --restore : persistent binary-level interception  */
+/* ------------------------------------------------------------------ */
+
+/* --bash: print a persistent bash wrapper that auto-loads active hooks */
+static void mode_bash(void)
+{
+    char self[4096];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    char *bin = "terhijack";
+    if (n > 0) { self[n] = '\0'; bin = self; }
+
+    fputs("#!/bin/bash\n", stdout);
+    fputs("# Auto-generated by terhijack --bash (persistent per-user bash hooking)\n", stdout);
+    fputs("# Every new bash loads the active TerHijack hooks, then runs the real bash.\n", stdout);
+    fputs("# Override with THJ_BIN / THJ_REAL_BASH / THJ_STATE_FILE.\n", stdout);
+    fputs("THJ_BIN=\"${THJ_BIN:-$(command -v terhijack 2>/dev/null)}\"\n", stdout);
+    printf("[ -n \"$THJ_BIN\" ] || THJ_BIN=\"%s\"\n", bin);
+    fputs("THJ_REAL_BASH=\"${THJ_REAL_BASH:-$(command -v bash 2>/dev/null)}\"\n", stdout);
+    fputs("[ -n \"$THJ_REAL_BASH\" ] || THJ_REAL_BASH=\"/data/data/com.termux/files/usr/bin/bash\"\n", stdout);
+    fputs("if [ -x \"$THJ_BIN\" ]; then\n", stdout);
+    fputs("  eval \"$(\"$THJ_BIN\" --init)\"\n", stdout);
+    fputs("  THJ_STATE_FILE=\"${THJ_STATE_FILE:-$HOME/.thj_state}\" __thj_load_file 2>/dev/null\n", stdout);
+    fputs("fi\n", stdout);
+    fputs("unset THJ_BIN 2>/dev/null\n", stdout);
+    fputs("exec \"$THJ_REAL_BASH\" \"$@\"\n", stdout);
+}
+
+/* --all: emit (or, via hijack --all, evaluate) a script that patches real
+ * binaries with the thj_patch shim backed by a .dat state file. */
+static void mode_all(void)
+{
+    load_state();
+    int have_ent = nents > 0;
+
+    puts("# TerHijack --all: binary-level interception (generated)");
+    puts("_THJ_PFX=\"${THJ_PFX:-${PREFIX:-/usr}/bin}\"");
+    puts("_THJ_SF=\"${THJ_DAT_FILE:-$HOME/.thj_patch.dat}\"");
+    puts(": > \"$_THJ_SF\"");
+
+    if (have_ent) {
+        for (size_t i = 0; i < nents; i++) {
+            char *fw = first_word(ents[i].pat);
+            if (strcmp(ents[i].ty, "out") == 0) {
+                char *q = sh_quote(ents[i].pay);
+                printf("printf '%%s\\tOUT\\t%%s\\n' '%s' %s >> \"$_THJ_SF\"\n",
+                       fw, q);
+                free(q);
+            } else if (strcmp(ents[i].ty, "rec") == 0) {
+                printf("printf '%%s\\tBLOCK\\n' '%s' >> \"$_THJ_SF\"\n", fw);
+            }
+            free(fw);
+        }
+    } else {
+        fputs("printf '%s\\tOUT\\t%s\\n' 'id' 'uid=0(root) gid=0(root) groups=0(root)' >> \"$_THJ_SF\"\n", stdout);
+        fputs("printf '%s\\tBLOCK\\n' 'cat' >> \"$_THJ_SF\"\n", stdout);
+        fputs("printf '%s\\tBLOCK\\n' 'head' >> \"$_THJ_SF\"\n", stdout);
+        fputs("printf '%s\\tBLOCK\\n' 'tail' >> \"$_THJ_SF\"\n", stdout);
+        fputs("printf '%s\\tBLOCK\\n' 'grep' >> \"$_THJ_SF\"\n", stdout);
+        fputs("printf '%s\\tBLOCK\\n' 'ls' >> \"$_THJ_SF\"\n", stdout);
+    }
+
+    fputs(
+"\n"
+"# locate the shim binary and stage a copy at $HOME\n"
+"_THJ_SRC=\"$(command -v terhijack 2>/dev/null)\"; _THJ_SRC=\"${_THJ_SRC%/terhijack}/thj_patch\"\n"
+"[ -x \"$_THJ_SRC\" ] || _THJ_SRC=\"$(command -v thj_patch 2>/dev/null)\"\n"
+"if [ -z \"$_THJ_SRC\" ] || [ ! -x \"$_THJ_SRC\" ]; then\n"
+"  echo \"terhijack: thj_patch binary not found (make install)\" >&2\n"
+"  return 1\n"
+"fi\n"
+"cp -f \"$_THJ_SRC\" \"$HOME/.thj_patch\" 2>/dev/null || return 1\n"
+"chmod 755 \"$HOME/.thj_patch\"\n"
+"\n"
+"# replace candidates: keep the original as <name>.thj_orig\n"
+"for _bn in id cat head tail grep ls mount ps who last hostname whoami uptime free df uname; do\n"
+"  _bp=\"$_THJ_PFX/$_bn\"\n"
+"  [ -e \"$_bp\" ] || continue\n"
+"  [ -e \"${_bp}.thj_orig\" ] && continue\n"
+"  if [ -L \"$_bp\" ]; then\n"
+"    _real=\"$(readlink -f \"$_bp\" 2>/dev/null)\"\n"
+"    if [ -n \"$_real\" ] && [ -f \"$_real\" ]; then\n"
+"      cp \"$_real\" \"${_bp}.thj_orig\" 2>/dev/null || continue\n"
+"    else\n"
+"      rm -f \"$_bp\" 2>/dev/null; continue\n"
+"    fi\n"
+"  else\n"
+"    cp \"$_bp\" \"${_bp}.thj_orig\" 2>/dev/null || continue\n"
+"  fi\n"
+"  rm -f \"$_bp\" 2>/dev/null\n"
+"  ln -s \"$HOME/.thj_patch\" \"$_bp\" 2>/dev/null || { cp \"$HOME/.thj_patch\" \"$_bp\" 2>/dev/null && chmod 755 \"$_bp\" 2>/dev/null; }\n"
+"done\n"
+"\n"
+"# register the FAKE map for `type` lookups\n"
+"_tmap=\"\"\n"
+"for _bn in id cat head tail grep ls mount ps who last hostname whoami uptime free df uname; do\n"
+"  _bp=\"$_THJ_PFX/$_bn\"\n"
+"  [ -e \"${_bp}.thj_orig\" ] || continue\n"
+"  _tmap=\"${_tmap:+$_tmap,}$_bn=${_bp}.thj_orig\"\n"
+"done\n"
+"[ -z \"$_tmap\" ] || printf 'type\\tFAKE\\t%s\\n' \"$_tmap\" >> \"$_THJ_SF\"\n"
+"\n"
+"echo \"# terhijack --all: ready - binaries patched via ELF patch (restore with --restore)\"\n",
+        stdout);
+}
+
+/* --restore: undo binary patching and clear session hooks */
+static void mode_restore(void)
+{
+    puts("# TerHijack --restore: undo binary patch and clear session hooks (generated)");
+    puts("_THJ_PFX=\"${THJ_PFX:-${PREFIX:-/usr}/bin}\"");
+    fputs("for _bn in id cat head tail grep ls mount ps who last hostname whoami uptime free df uname; do\n",
+          stdout);
+    fputs("  _bp=\"$_THJ_PFX/$_bn\"\n", stdout);
+    fputs("  [ -e \"${_bp}.thj_orig\" ] || continue\n", stdout);
+    fputs("  rm -f \"$_bp\" 2>/dev/null\n", stdout);
+    fputs("  mv \"${_bp}.thj_orig\" \"$_bp\" 2>/dev/null\n", stdout);
+    fputs("done\n", stdout);
+    fputs("rm -f \"$HOME/.thj_patch\" \"${THJ_DAT_FILE:-$HOME/.thj_patch.dat}\" 2>/dev/null\n", stdout);
+    fputs(RUNTIME, stdout);
+    fputs("__THJ_P=()\n__THJ_T=()\n__THJ_A=()\n__THJ_M=()\n__THJ_FN=()\n", stdout);
+    fputs("__terhijack_rebuild\n", stdout);
+    fputs("# terhijack --restore: done\n", stdout);
 }
 
 /* ------------------------------------------------------------------ */
@@ -719,6 +934,8 @@ static void usage(FILE *f)
 "  hijack -c \"a && b && c\" -r \"echo x\"  hijack whole compound lines\n"
 "  hijack -c \"ls/pwd/id\" -o \"x\"         several commands at once\n"
 "  hijack --list | -x \"cmd\" | --clear\n"
+"  hijack --all / --restore       patch real binaries / undo\n"
+"  terhijack --bash > b.sh        persistent bash wrapper (then alias bash=b.sh)\n"
 "\n"
 "options:\n"
 "  -c, --command CMD     command line(s) to hijack; reusable; '/' lists\n"
@@ -730,10 +947,20 @@ static void usage(FILE *f)
 "  -l, --list            list active hijacks\n"
 "      --clear           drop every hijack\n"
 "      --init            print the shell bootstrap\n"
+"      --all             binary-level interception: replace real binaries\n"
+"                        (id cat head tail grep ls mount ps who last\n"
+"                        hostname whoami uptime free df uname) with the\n"
+"                        thj_patch shim answering this session's hooks;\n"
+"                        with no session hooks it installs uid/gid default\n"
+"      --restore         undo --all (binaries + shims + state files)\n"
+"      --bash            print a persistent bash wrapper that loads active\n"
+"                        hooks into every new bash session\n"
 "  -h, --help            show this help\n"
 "  -V, --version         show version\n"
 "\n"
-"hooks live only inside the current session; a new session is clean.\n",
+"hooks live only inside the current session; a new session is clean.\n"
+"persistence knobs: THJ_STATE_FILE (bash hooks), THJ_DAT_FILE (.dat shim\n"
+"map), THJ_PFX (binaries dir override, for safe testing).\n",
     f);
 }
 
@@ -743,6 +970,7 @@ int main(int argc, char **argv)
     size_t ncmds = 0, capcmds = 0;
     const char *opt_out = NULL, *opt_rec = NULL, *opt_rem = NULL;
     int m_arg = 0, m_list = 0, m_clear = 0, m_init = 0, m_help = 0, m_ver = 0;
+    int m_bash = 0, m_all = 0, m_restore = 0;
 
     static const struct option longopts[] = {
         {"command",   required_argument, 0, 'c'},
@@ -753,13 +981,16 @@ int main(int argc, char **argv)
         {"list",      no_argument,       0, 'l'},
         {"clear",     no_argument,       0, 'C'},
         {"init",      no_argument,       0, 'I'},
+        {"bash",      no_argument,       0, 'B'},
+        {"all",       no_argument,       0, 'A'},
+        {"restore",   no_argument,       0, 'R'},
         {"help",      no_argument,       0, 'h'},
         {"version",   no_argument,       0, 'V'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "c:o:r:x:alChV", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "c:o:r:x:alCIBAhV", longopts, NULL)) != -1) {
         switch (c) {
         case 'c':
             if (ncmds == capcmds) {
@@ -776,6 +1007,9 @@ int main(int argc, char **argv)
         case 'l': m_list = 1; break;
         case 'C': m_clear = 1; break;
         case 'I': m_init = 1; break;
+        case 'B': m_bash = 1; break;
+        case 'A': m_all = 1; break;
+        case 'R': m_restore = 1; break;
         case 'h': m_help = 1; break;
         case 'V': m_ver = 1; break;
         default:
@@ -791,6 +1025,9 @@ int main(int argc, char **argv)
     if (m_help)  { usage(stdout); return 0; }
     if (m_ver)   { printf("TerHijack %s\n", THJ_VERSION); return 0; }
     if (m_init)  { mode_init(); return 0; }
+    if (m_all)   { mode_all(); return 0; }
+    if (m_restore) { mode_restore(); return 0; }
+    if (m_bash)  { mode_bash(); return 0; }
     if (m_list)  { mode_list(); return 0; }
     if (m_clear) { mode_clear(); return 0; }
     if (opt_rem) { mode_remove(opt_rem); return 0; }

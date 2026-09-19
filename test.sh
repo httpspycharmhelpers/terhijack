@@ -1,5 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# TerHijack v1.1 functional test suite
+# TerHijack v1.2 functional test suite
 set -u
 cd "$(dirname "$0")"
 BIN="$PWD/terhijack"
@@ -123,6 +123,16 @@ out="$(hijack --list | grep -c '^\[\*\]')"
 t "'/' list not misdetected" "1" "$out"
 t "path pattern intact"      "FakeVersion" "$(cat /proc/version)"
 
+### F2. '~' and relative paths must NOT be split by '/'
+hijack --clear
+hijack -c "cat ./x" -o "FakeRel"
+t "'./' not split"     "1" "$(hijack --list | grep -c '^\[\*\]')"
+t "'./' pattern works" "FakeRel" "$(cd "$HOME"; cat ./x)"
+hijack --clear
+hijack -c "cat ~/test" -o "FakeHome"
+t "'~/' not split"     "1" "$(hijack --list | grep -c '^\[\*\]')"
+hijack --clear
+
 ### G. cleanup & isolation
 hijack --clear
 t "clear restores id"  "$(declare -F id >/dev/null && echo hooked || echo clean)" "clean"
@@ -133,5 +143,42 @@ t "new session unaffected" "file" "$fresh"
 hijack -c "id -Z" -o "it's \"root\""
 t "payload quoted safely" 'it'"'"'s "root"' "$(id -Z)"
 hijack --clear
+
+### H. NEW: --bash persistent wrapper (hooks auto-load into fresh bash)
+TS="$HOME/.thj_test_state_$$"
+WS="$HOME/.thj_test_wrap_$$"
+hijack --clear
+hijack -c "id -Z" -o "root-wrapped"
+THJ_STATE_FILE="$TS" hijack -c "id" -o "uid=0(root)"
+"$BIN" --bash > "$WS"; chmod +x "$WS"
+out="$(THJ_STATE_FILE="$TS" "$BASH" "$WS" -c 'id')"
+t "--bash loads hooks" "uid=0(root)" "$out"
+out="$(THJ_STATE_FILE="$TS" "$BASH" "$WS" -c 'hijack --list' | grep -c '^\[\*\]')"
+t "--bash management survives exec" "2" "$out"
+rm -f "$TS" "$WS"
+
+### I. NEW: --all / --restore binary-level patch (THJ_PFX sandbox)
+SD="$HOME/.thj_test_sb_$$"
+mkdir -p "$SD/bin"
+printf '#!/data/data/com.termux/files/usr/bin/bash\necho "REAL-ID"\n' > "$SD/bin/id"
+printf '#!/data/data/com.termux/files/usr/bin/bash\necho "REAL-CAT:$*"\n' > "$SD/bin/cat"
+chmod +x "$SD/bin/id" "$SD/bin/cat"
+D="$SD/thj.dat"
+export THJ_DAT_FILE="$D"
+out="$(THJ_PFX="$SD/bin" "$BASH" -c 'source <("'"$BIN"'" --all)' )"
+case "$out" in *ready*) t "--all installs shims" y y ;; *) t "--all installs shims" y n ;; esac
+hijack --clear
+t "OUT   id forced"   "uid=0(root) gid=0(root) groups=0(root)" "$(PATH="$SD/bin:$PATH" id)"
+t "PASS  cat passes"  "REAL-CAT:foo" "$(PATH="$SD/bin:$PATH" cat foo)"
+PATH="$SD/bin:$PATH" cat /proc/version 2>/dev/null; rc=$?
+t "BLOCK /proc denied" "1" "$rc"
+out="$(THJ_DAT_FILE="$D" "$BASH" -c 'exec -a type "$HOME/.thj_patch" id')"
+t "FAKE  type id"     "$SD/bin/id.thj_orig" "${out#id is }"
+hijack --clear
+THJ_PFX="$SD/bin" "$BASH" -c 'source <("'"$BIN"'" --restore)'
+t "restore id back"   "REAL-ID" "$(PATH="$SD/bin:$PATH" id)"
+t "restore no backup" "n" "$([ -e "$SD/bin/id.thj_orig" ] && echo y || echo n)"
+unset THJ_DAT_FILE
+rm -rf "$SD"
 
 exit $fail

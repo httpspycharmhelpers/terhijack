@@ -1,6 +1,7 @@
 # build artifacts
 terhijack
 terhijack.bin
+thj_patch
 *.o
 
 # experiment leftovers

@@ -21,14 +21,18 @@ TerHijack is a layered interception system:
    current bash session: rewrite output, replace the command, pass caller
    arguments through, take over entire compound chains, and even shadow
    builtins.
-2. **Disguise suite** (`root_disguise.sh`) — builds a fully self-consistent
+2. **Binary-level layer** (`--all` / `thj_patch`) — **ELF patch**: replaces the
+   real binaries (`id cat head tail grep ls mount ps who last hostname whoami
+   uptime free df uname`) with a shim that answers `OUT`/`BLOCK`/`FAKE`
+   records — outliving the shell. Reversible with `--restore`.
+3. **Disguise suite** (`root_disguise.sh`) — builds a fully self-consistent
    fake-root environment on top: identity, SELinux, processes, networking,
    filesystem, `/proc`, plus self-hiding of the tool.
-3. **Collaboration layer** (being integrated with aFakeSU / embedded proot) —
+4. **Collaboration layer** (being integrated with aFakeSU / embedded proot) —
    planned `ptrace` syscall interception so even **non-shell processes**
    cannot bypass the disguise.
 
-Nothing survives the session. A fresh shell is completely clean.
+Sessions are clean by default; persistence is opt-in (`--bash`, `--all`).
 
 ---
 
@@ -46,7 +50,7 @@ Nothing survives the session. A fresh shell is completely clean.
 | Builtin takeover | `hijack -c "exit" -o "MOCK"` | `exit`, `logout`, `cd`, `echo` and other builtins are shadowed too |
 
 Long options (`--command --output --recommand --arg --list --clear --init
---remove`) are aliases for the short ones.
+--remove --bash --all --restore`) are aliases for the short ones.
 
 ### Usage
 
@@ -60,7 +64,44 @@ hijack -c "ls/pwd/id" -o "x"                     # several commands at once
 hijack --list                                    # show active hooks
 hijack -x "id -Z"                                # remove one hook
 hijack --clear                                   # drop every hook
+# --- persistence ---
+terhijack --bash > ~/hooked-bash                 # wrapper: hooks every new bash
+alias bash="$HOME/hooked-bash"
+hijack --all                                     # patch real binaries (ELF shim)
+hijack --restore                                 # undo the binary patch
 ```
+
+### Persistence & binary-level layer
+
+Two opt-in mechanisms make hooks survive the current shell; both are
+default-off and fully reversible.
+
+**`terhijack --bash` — persistent bash wrapper.** Generates a small script
+that, when used as `bash`, `eval`s `--init`, reloads the saved hook state and
+then `exec`s the real bash. `THJ_REAL_BASH` / `THJ_BIN` / `THJ_STATE_FILE`
+override resolution. Place it earlier in `PATH` or `alias bash=...` to hook
+every new bash; management (`hijack ...`) works normally inside wrapped
+sessions.
+
+**`hijack --all` — binary-level ELF patch.** Takes the real binaries
+(`id cat head tail grep ls mount ps who last hostname whoami uptime free df
+uname`), keeps each as `<name>.thj_orig`, and puts the `thj_patch` shim in
+their place. Invocations dispatch on a `.dat` state file (records,
+`name<TAB>TYPE<TAB>payload`):
+- `OUT` — print a fake payload (`id` → `uid=0(root) ...`) and exit 0
+- `BLOCK` — refuse `/proc` & `/sys` access with `Permission denied`
+- `FAKE` — answer `type <name>` with the real (backup) path
+- (no record) — transparently run the real binary from the backup
+Called with active session hooks (`hijack --all`) it installs exactly those;
+called bare (`terhijack --all`) it installs defaults (`id`→root, cat/head/
+tail/grep/ls→block). `hijack --restore` restores every backup and clears the
+state. Env overrides for safe experimentation: `THJ_DAT_FILE`, `THJ_PFX`
+(where the binaries live — point it at a throwaway dir in tests).
+
+**State files.** Set `THJ_STATE_FILE` (bash-hook TSV) and/or `THJ_DAT_FILE`
+(shim `.dat`) and every `hijack` call re-persists them; `__thj_load_file` /
+the `--bash` wrapper restore them. Nothing writes to disk unless one of these
+is set.
 
 ### What "degree of takeover" means here
 
@@ -158,7 +199,7 @@ hijack --clear            # one-command restore
 
 ## Test breadth & iteration history
 
-`test.sh` holds **40 assertions** across every mode and its long-flag
+`test.sh` holds **52 assertions** across every mode and its long-flag
 aliases, built by repeatedly breaking the tool in real use:
 
 | Area | What is verified |
@@ -166,10 +207,13 @@ aliases, built by repeatedly breaking the tool in real use:
 | Output / replace / arg-pass | all three modes, short + long flags |
 | Compound commands | `&&` chain takeover, `;` neutralization, real side-effects suppressed |
 | `cat /proc/*` | not mis-split by the `/`-list heuristic |
+| Path-vs-list disambiguation | `cat /proc/x`, `cat ~/x`, `cat ./x` stay single hooks; `ls/pwd/id` still splits |
 | Builtin takeover | `echo`-level infrastructure commands |
 | Argument boundaries | exact match does not leak to other invocations; `-a` passes multiple and space-containing args |
 | Session boundaries | child bash inherits; `--clear` restores functions; fresh session clean |
 | Leak surface | quoted/escaped payloads evaluated safely |
+| Persistence (`--bash`) | hooks + management survive a fresh `bash` via the wrapper |
+| Binary layer (`--all`) | OUT/BLOCK/FAKE/pass behaviors; `--restore` fully reverts |
 
 **Iterations driven by your requirements / bug reports:**
 - Compound `&&` lines were mis-handled by the original DEBUG-trap approach →
@@ -180,6 +224,10 @@ aliases, built by repeatedly breaking the tool in real use:
   `"$@"` into the replacement eval.
 - `/proc/<pid>/status` dynamic UID/GID/Caps, SELinux context, and trace
   self-hiding were hardened across reported rounds.
+- `~/test` and `cat ~/x` were wrongly split into `~`/`test`/`cat` by the
+  `/`-list feature → every `/` segment must now be a clean command name, and
+  `~`/`.`-paths are excluded; `hijack -c "~/test"` is rejected instead of
+  silently mis-registered. (v1.2)
 
 ---
 
@@ -194,6 +242,7 @@ process**, shell or not.
 
 ```
   bash session: function shadowing + dispatch   (done)
+  binary layer: thj_patch ELF shim (--all)      (done, v1.2)
   disguise:     40+ coherent __root_* payloads   (done)
   syscalls:     proot-style ptrace interception  (roadmap)
 ```
@@ -224,6 +273,14 @@ process**, shell or not.
 6. **Payloads using the hijacked command cascade-trigger** (e.g. a `-r` chain
    on `echo` containing `echo`); design triggers around non-builtin commands
    where possible.
+7. **`--all` touches real binaries** (`$PREFIX/bin/...` → shim, original kept
+   as `*.thj_orig`). It is disabled-at-checkout by design and reversible with
+   `--restore`, but if a backup goes missing the shim refuses to exec rather
+   than loop. Test with a `THJ_PFX` throwaway dir first.
+8. **`--bash` wrapper changes every new bash**, including automation that
+   spawns `bash`; combined with `THJ_STATE_FILE` it makes hooks durable across
+   sessions, so a bad payload can follow you. Prefer session-scoped hooks for
+   one-off work.
 
 ## Intended use
 
@@ -242,9 +299,9 @@ contexts, illegal. Keep it on your own devices.
 ## Build & test
 
 ```bash
-make            # cc -O2 -Wall -Wextra -std=c99 -> ./terhijack
-make install    # installs to $PREFIX/bin/terhijack
-bash test.sh    # 40 functional assertions
+make            # cc -O2 -Wall -Wextra -std=c99 -> ./terhijack + ./thj_patch
+make install    # installs both to $PREFIX/bin/
+bash test.sh    # 52 functional assertions
 ```
 
 Requires bash ≥ 4 (arrays, `"${!arr[@]}"`). zsh: function shadowing works;
